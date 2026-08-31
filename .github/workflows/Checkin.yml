@@ -37,7 +37,7 @@ jobs:
       # 2. 安装 Python
       # ==============================
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -53,7 +53,7 @@ jobs:
       # 4. 缓存 Playwright 浏览器
       # ==============================
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright

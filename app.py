@@ -48,6 +48,44 @@ USER_AGENT = (
     "Chrome/125.0.0.0 Safari/537.36"
 )
 
+# 登录表单元素候选选择器
+# （new-api 系站点兼容）
+LOGIN_FORM_INPUT_SELECTOR = (
+    'input#username, input[name="username"], '
+    'input[name="email"], input[type="password"]'
+)
+
+USERNAME_SELECTORS = (
+    "input#username",
+    'input[name="username"]',
+    'input[name="email"]',
+    'form input[type="text"]',
+)
+
+PASSWORD_SELECTORS = (
+    "input#password",
+    'input[name="password"]',
+    'input[type="password"]',
+)
+
+SUBMIT_SELECTORS = (
+    'button[type="submit"]',
+    'button:text-is("登录")',
+    'button:text-is("登 录")',
+    'button:text-is("Log In")',
+    'button:text-is("Sign In")',
+)
+
+# 邮箱登录入口的候选文案
+EMAIL_LOGIN_TEXTS = (
+    "Sign in with Email or Username",
+    "Email or Username",
+    "Sign in with Email",
+    "账号登录",
+    "邮箱登录",
+    "密码登录",
+)
+
 
 # ============================================================
 # 代理池配置
@@ -72,6 +110,13 @@ PROBE_TIMEOUT = 15
 PROBE_WORKERS = 50
 
 MAX_LOGIN_ATTEMPTS = 3
+
+# 每个账号代理池登录轮数上限
+# （一轮登录全部失败后，
+#   重新随机提取代理再试，最多这么多轮）
+PROXY_LOGIN_ROUNDS = int(
+    os.getenv("PROXY_LOGIN_ROUNDS") or "5"
+)
 
 
 # ============================================================
@@ -243,11 +288,22 @@ def parse_accounts() -> list:
 
     accounts = []
 
+    invalid_lines = []
+
     if ACCOUNTS:
 
-        for raw_line in ACCOUNTS.splitlines():
+        for line_no, raw_line in enumerate(
+            ACCOUNTS.splitlines(),
+            start=1,
+        ):
 
-            line = raw_line.strip()
+            # 清理 BOM / 零宽字符 / 全角竖线
+            line = (
+                raw_line.replace("\ufeff", "")
+                .replace("\u200b", "")
+                .replace("\uff5c", "|")
+                .strip()
+            )
 
             if not line:
                 continue
@@ -263,7 +319,13 @@ def parse_accounts() -> list:
 
                 site_url = site_url.strip()
 
+            # 全角冒号兜底
+            # （仅当行内没有半角冒号时才转换）
+            if ":" not in body and "：" in body:
+                body = body.replace("：", ":")
+
             if ":" not in body:
+                invalid_lines.append(line_no)
                 continue
 
             username, _, password = body.partition(":")
@@ -273,6 +335,7 @@ def parse_accounts() -> list:
             password = password.strip()
 
             if not username or not password:
+                invalid_lines.append(line_no)
                 continue
 
             # 站点归一化
@@ -290,6 +353,16 @@ def parse_accounts() -> list:
                     "username": username,
                     "password": password,
                 }
+            )
+
+        if invalid_lines:
+
+            log(
+                "配置警告：ACCOUNTS 第 "
+                + ", ".join(
+                    str(n) for n in invalid_lines
+                )
+                + " 行格式无效，已跳过"
             )
 
     # 兼容旧单账号配置
@@ -336,6 +409,43 @@ def mask_site(
     visible = domain[:4]
 
     return f"{visible}***"
+
+
+def mask_proxy(
+    proxy_item: dict,
+) -> str:
+
+    """
+    代理 IP 打码。
+
+    只保留前两段，其余屏蔽。
+    例：124.248.13.5:1080 -> 124.248.***.***:1080
+    """
+
+    ip = str(proxy_item.get("ip") or "")
+
+    port = proxy_item.get("port") or ""
+
+    parts = ip.split(".")
+
+    if (
+        len(parts) == 4
+        and all(
+            part.isdigit()
+            for part in parts
+        )
+    ):
+
+        return (
+            f"{parts[0]}.{parts[1]}"
+            f".***.***:{port}"
+        )
+
+    # 非 IPv4（域名 / IPv6）：
+    # 只保留前 4 位
+    visible = ip[:4]
+
+    return f"{visible}***:{port}"
 
 
 # ============================================================
@@ -633,6 +743,8 @@ def find_clean_proxies(
 
     pool = fetch_proxy_pool()
 
+    log(f"代理池获取: {len(pool)} 个代理")
+
     # 国家过滤
     if PROXY_COUNTRY:
 
@@ -644,6 +756,10 @@ def find_clean_proxies(
             ).upper()
             == PROXY_COUNTRY
         ]
+
+        log(
+            f"国家过滤后: {len(pool)} 个代理"
+        )
 
         if not pool:
             raise Exception("代理池过滤后为空")
@@ -704,6 +820,21 @@ def find_clean_proxies(
         )
     )
 
+    # 只输出数量与阶段码，不含敏感信息
+    reason_text = ", ".join(
+        f"{key} {value}"
+        for key, value in sorted(
+            stats.items(),
+            key=lambda kv: -kv[1],
+        )[:3]
+    )
+
+    log(
+        f"代理池探测: 扫描 {scanned} 个，"
+        f"可用 {len(clean_proxies)} 个"
+        + (f"（{reason_text}）" if reason_text else "")
+    )
+
     return clean_proxies
 
 
@@ -715,6 +846,11 @@ CLEAN_PROXIES_BY_SITE = {}
 
 POOL_BROKEN_SITES = set()
 
+# 直连兜底已失败的站点
+# （ Runner IP 被 WAF 拦截时，
+#   后续账号不再重复直连，避免无效耗时 ）
+DIRECT_FAILED_SITES = set()
+
 
 def pop_proxy(
     site_url: str,
@@ -724,7 +860,9 @@ def pop_proxy(
     """
     从该站点的共享代理队列取一个干净代理。
 
-    队列耗尽时针对该站点重新探测，
+    每个代理在交给浏览器登录前都会现场复检，
+    复检失败立即丢弃并尝试下一个；
+    队列耗尽时针对该站点重新探测少量代理，
     探测失败则本次运行不再尝试该站点的代理池。
     """
 
@@ -735,34 +873,76 @@ def pop_proxy(
         site_url
     ) or []
 
+    # ------------------------------------------------
+    # 现场复检：剔除探测后已失效的代理
+    # （免费代理存活期短，预探测的代理
+    #   到真正登录时可能已经死了）
+    # ------------------------------------------------
+
+    while queue:
+
+        candidate = queue.pop(0)
+
+        fresh, _ = probe_proxy(
+            candidate,
+            site_url,
+        )
+
+        if fresh is not None:
+            CLEAN_PROXIES_BY_SITE[site_url] = queue
+            return fresh
+
+    # ------------------------------------------------
+    # 队列耗尽：重新探测少量代理
+    #
+    # 不再按账号数批量预留：
+    # 预留越多，到使用时失效越多，
+    # 且首次探测耗时随账号数爆炸
+    # ------------------------------------------------
+
+    log("代理队列耗尽，重新探测代理池")
+
+    try:
+
+        queue = find_clean_proxies(
+            site_url=site_url,
+            needed_count=MAX_LOGIN_ATTEMPTS,
+        )
+
+    except Exception:
+
+        # 不打印异常详情
+        queue = []
+
+    CLEAN_PROXIES_BY_SITE[site_url] = queue
+
     if not queue:
 
-        try:
+        POOL_BROKEN_SITES.add(site_url)
 
-            needed = max(
-                1,
-                MAX_LOGIN_ATTEMPTS * total_accounts,
-            )
+        log("代理池不可用，本次运行跳过代理池通道")
 
-            queue = find_clean_proxies(
-                site_url=site_url,
-                needed_count=needed,
-            )
+        return None
 
-        except Exception:
+    # ------------------------------------------------
+    # 复检刚探测到的代理，
+    # 全部当场失效则返回 None
+    # ------------------------------------------------
 
-            # 不打印异常详情
-            queue = []
+    while queue:
 
-        CLEAN_PROXIES_BY_SITE[site_url] = queue
+        candidate = queue.pop(0)
 
-        if not queue:
+        fresh, _ = probe_proxy(
+            candidate,
+            site_url,
+        )
 
-            POOL_BROKEN_SITES.add(site_url)
+        if fresh is not None:
+            CLEAN_PROXIES_BY_SITE[site_url] = queue
+            return fresh
 
-            return None
-
-    return queue.pop(0)
+    return None
 
 
 # ============================================================
@@ -803,13 +983,13 @@ def wait_for_waf_ready(
                         (document.body &&
                          document.body.innerText) || '';
 
-                    const hasInputs =
-                        document.querySelectorAll(
-                            'input'
-                        ).length > 0;
+                    const hasLoginForm =
+                        !!document.querySelector(
+                            'input#username, input[name="username"], input[name="email"], input[type="password"]'
+                        );
 
                     const hasLoginButton =
-                        /Sign in with Email or Username|Log In|登录/
+                        /Sign in with Email or Username|Email or Username|Log In|Sign In|登录|账号登录|邮箱登录/
                         .test(bodyText);
 
                     const challengeSelectors = [
@@ -834,7 +1014,7 @@ def wait_for_waf_ready(
                             .includes('verification');
 
                     return {
-                        hasInputs,
+                        hasLoginForm,
                         hasLoginButton,
                         isChallenge
                     };
@@ -850,7 +1030,7 @@ def wait_for_waf_ready(
 
         # 登录页面已经出现
         if (
-            state.get("hasInputs")
+            state.get("hasLoginForm")
             or state.get("hasLoginButton")
         ):
             return True
@@ -908,25 +1088,34 @@ def click_email_login_button(
 ) -> bool:
 
     # 优先 Playwright 定位
-    try:
+    # （首个候选给足超时，其余快速尝试）
+    for index, text in enumerate(
+        EMAIL_LOGIN_TEXTS
+    ):
 
-        target = page.get_by_text(
-            "Sign in with Email or Username"
-        )
+        try:
 
-        target.first.wait_for(
-            state="visible",
-            timeout=timeout_ms,
-        )
+            target = page.get_by_text(
+                text
+            )
 
-        target.first.click(
-            timeout=10000
-        )
+            target.first.wait_for(
+                state="visible",
+                timeout=(
+                    timeout_ms
+                    if index == 0
+                    else 3000
+                ),
+            )
 
-        return True
+            target.first.click(
+                timeout=10000
+            )
 
-    except Exception:
-        pass
+            return True
+
+        except Exception:
+            continue
 
     # JS 回退
     try:
@@ -941,21 +1130,26 @@ def click_email_login_button(
                         )
                     );
 
+                const wanted = [
+                    'Sign in with Email or Username',
+                    'Email or Username',
+                    'Sign in with Email',
+                    '账号登录',
+                    '邮箱登录',
+                    '密码登录'
+                ];
+
                 const target =
                     candidates.find(el => {
                         const text =
                             (el.innerText || '').trim();
 
                         return (
-                            text ===
-                            'Sign in with Email or Username'
+                            wanted.includes(text)
                             ||
                             text.includes(
                                 'Email or Username'
                             )
-                            ||
-                            text ===
-                            'Sign in with Email'
                         );
                     });
 
@@ -979,14 +1173,100 @@ def click_email_login_button(
 
 
 # ============================================================
+# 自有节点 → 目标站连通性预测试
+# ============================================================
+
+def own_node_reaches_site(
+    site_url: str,
+) -> bool:
+
+    """
+    测试自有节点能否连通目标站点。
+
+    仅判断传输层连通性：
+    收到任何 HTTP 响应（含 WAF 拦截页）都算可达；
+    只有超时 / 连接失败才算不可达。
+    """
+
+    proxies = {
+        "http": PROXY_SERVER,
+        "https": PROXY_SERVER,
+    }
+
+    try:
+
+        requests.get(
+            f"{site_url}/login",
+            headers=BROWSER_HEADERS,
+            proxies=proxies,
+            timeout=PROBE_TIMEOUT,
+            allow_redirects=True,
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+# ============================================================
 # 浏览器登录
 # ============================================================
+
+class _LoginStageError(Exception):
+
+    """
+    登录流程阶段异常。
+
+    只携带阶段码，不携带任何页面信息。
+    """
+
+    def __init__(self, stage: str):
+
+        super().__init__(stage)
+
+        self.stage = stage
+
+
+def _first_visible_locator(
+    page,
+    selectors,
+    timeout_ms: int = 4000,
+):
+
+    """
+    依次尝试候选选择器，
+    返回第一个可见的 Locator，找不到返回 None。
+    """
+
+    for selector in selectors:
+
+        try:
+
+            locator = page.locator(
+                selector
+            )
+
+            if locator.count() == 0:
+                continue
+
+            locator.first.wait_for(
+                state="visible",
+                timeout=timeout_ms,
+            )
+
+            return locator.first
+
+        except Exception:
+            continue
+
+    return None
+
 
 def browser_login_complete(
     account: dict,
     proxy: dict | None = None,
-) -> dict | None:
-
+) -> tuple:
     # --------------------------------------------------------
     # 代理配置
     # --------------------------------------------------------
@@ -1021,63 +1301,96 @@ def browser_login_complete(
 
     result = None
 
+    stage = "UNKNOWN"
+
     with sync_playwright() as p:
 
-        browser = p.chromium.launch(
-
-            headless=True,
-
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-
-            proxy=proxy_config,
-        )
-
-        context = browser.new_context(
-
-            viewport={
-                "width": 1920,
-                "height": 1080,
-            },
-
-            user_agent=USER_AGENT,
-        )
-
-        page = context.new_page()
+        browser = None
 
         try:
 
+            browser = p.chromium.launch(
+
+                headless=True,
+
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+
+                proxy=proxy_config,
+            )
+
+            context = browser.new_context(
+
+                viewport={
+                    "width": 1920,
+                    "height": 1080,
+                },
+
+                user_agent=USER_AGENT,
+            )
+
+            page = context.new_page()
+
             # ------------------------------------------------
             # Step 1：访问登录页
+            #
+            # commit：收到首包即认为导航开始，
+            # 页面内容由后续 WAF 等待逻辑轮询，
+            # 避免慢代理下 domcontentloaded 直接超时。
+            # 超时后重试一次。
             # ------------------------------------------------
 
-            page.goto(
-                f"{account['site']}/login",
-                wait_until="domcontentloaded",
-                timeout=45000,
-            )
+            goto_done = False
+
+            for _ in range(2):
+
+                try:
+
+                    page.goto(
+                        f"{account['site']}/login",
+                        wait_until="commit",
+                        timeout=45000,
+                    )
+
+                    goto_done = True
+
+                    break
+
+                except PlaywrightTimeoutError:
+
+                    continue
+
+            if not goto_done:
+
+                raise _LoginStageError(
+                    "GOTO_TIMEOUT"
+                )
 
             # ------------------------------------------------
             # Step 2：等待 WAF
             # ------------------------------------------------
 
-            wait_for_waf_ready(
+            if not wait_for_waf_ready(
                 page,
                 context=context,
-                timeout_ms=45000,
-            )
+                timeout_ms=60000,
+            ):
+
+                raise _LoginStageError(
+                    "WAF_TIMEOUT"
+                )
 
             # ------------------------------------------------
-            # 检查页面是否有输入框
+            # 检查页面是否有登录表单输入框
             # ------------------------------------------------
 
             has_inputs = page.locator(
-                "input"
+                LOGIN_FORM_INPUT_SELECTOR
             ).count()
 
             # ------------------------------------------------
@@ -1093,8 +1406,8 @@ def browser_login_complete(
                 if not clicked:
 
                     # 不输出页面文本、HTML、URL
-                    raise Exception(
-                        "登录表单未出现"
+                    raise _LoginStageError(
+                        "FORM_NOT_FOUND"
                     )
 
                 page.wait_for_timeout(
@@ -1119,12 +1432,12 @@ def browser_login_complete(
 
                         const username =
                             document.querySelector(
-                                'input#username'
+                                'input#username, input[name="username"], input[name="email"], form input[type="text"]'
                             );
 
                         const password =
                             document.querySelector(
-                                'input#password'
+                                'input#password, input[name="password"], input[type="password"]'
                             );
 
                         const submit =
@@ -1132,13 +1445,17 @@ def browser_login_complete(
                                 'button[type="submit"]'
                             );
 
+                        const visible = el =>
+                            el &&
+                            (
+                                el.offsetParent !== null ||
+                                el.getClientRects().length > 0
+                            );
+
                         if (
-                            username &&
-                            password &&
-                            submit &&
-                            username.offsetParent !== null &&
-                            password.offsetParent !== null &&
-                            submit.offsetParent !== null
+                            visible(username) &&
+                            visible(password) &&
+                            visible(submit)
                         ) {
 
                             return {
@@ -1168,74 +1485,88 @@ def browser_login_complete(
                 "success"
             ):
 
-                raise Exception(
-                    "登录表单未出现"
+                raise _LoginStageError(
+                    "FORM_NOT_FOUND"
                 )
 
             # ------------------------------------------------
             # 填写用户名
             # ------------------------------------------------
 
-            username_locator = page.locator(
-                "input#username"
-            )
+            try:
 
-            username_locator.wait_for(
-                state="visible",
-                timeout=5000,
-            )
+                username_locator = _first_visible_locator(
+                    page,
+                    USERNAME_SELECTORS,
+                )
 
-            username_locator.click(
-                timeout=5000
-            )
+                if username_locator is None:
 
-            username_locator.fill(
-                account["username"],
-                timeout=5000,
-            )
+                    raise _LoginStageError(
+                        "FORM_NOT_FOUND"
+                    )
 
-            # ------------------------------------------------
-            # 填写密码
-            # ------------------------------------------------
+                username_locator.click(
+                    timeout=5000
+                )
 
-            password_locator = page.locator(
-                "input#password"
-            )
+                username_locator.fill(
+                    account["username"],
+                    timeout=5000,
+                )
 
-            password_locator.wait_for(
-                state="visible",
-                timeout=5000,
-            )
+                # --------------------------------------------
+                # 填写密码
+                # --------------------------------------------
 
-            password_locator.click(
-                timeout=5000
-            )
+                password_locator = _first_visible_locator(
+                    page,
+                    PASSWORD_SELECTORS,
+                )
 
-            password_locator.fill(
-                account["password"],
-                timeout=5000,
-            )
+                if password_locator is None:
 
-            page.wait_for_timeout(
-                1000
-            )
+                    raise _LoginStageError(
+                        "FORM_NOT_FOUND"
+                    )
 
-            # ------------------------------------------------
-            # Step 4：提交
-            # ------------------------------------------------
+                password_locator.click(
+                    timeout=5000
+                )
 
-            submit_locator = page.locator(
-                'button[type="submit"]'
-            )
+                password_locator.fill(
+                    account["password"],
+                    timeout=5000,
+                )
 
-            submit_locator.wait_for(
-                state="visible",
-                timeout=5000,
-            )
+                page.wait_for_timeout(
+                    1000
+                )
 
-            submit_locator.click(
-                timeout=5000
-            )
+                # --------------------------------------------
+                # Step 4：提交
+                # --------------------------------------------
+
+                submit_locator = _first_visible_locator(
+                    page,
+                    SUBMIT_SELECTORS,
+                )
+
+                if submit_locator is None:
+
+                    raise _LoginStageError(
+                        "FORM_NOT_FOUND"
+                    )
+
+                submit_locator.click(
+                    timeout=5000
+                )
+
+            except PlaywrightTimeoutError:
+
+                raise _LoginStageError(
+                    "FORM_OPERATE_TIMEOUT"
+                )
 
             # ------------------------------------------------
             # Step 5：等待登录
@@ -1388,8 +1719,10 @@ def browser_login_complete(
                 "success"
             ):
 
-                raise Exception(
-                    "获取余额失败"
+                # 登录后拿不到用户信息，
+                # 通常是凭据错误或验证码拦截
+                raise _LoginStageError(
+                    "USER_API_FAIL"
                 )
 
             payload = api_result.get(
@@ -1406,8 +1739,8 @@ def browser_login_complete(
                 ) is not True
             ):
 
-                raise Exception(
-                    "余额接口返回失败"
+                raise _LoginStageError(
+                    "API_PAYLOAD_FAIL"
                 )
 
             user_data = payload.get(
@@ -1419,8 +1752,8 @@ def browser_login_complete(
                 dict
             ):
 
-                raise Exception(
-                    "余额数据无效"
+                raise _LoginStageError(
+                    "API_PAYLOAD_FAIL"
                 )
 
             # ------------------------------------------------
@@ -1439,8 +1772,8 @@ def browser_login_complete(
                 )
             ):
 
-                raise Exception(
-                    "余额数据无效"
+                raise _LoginStageError(
+                    "QUOTA_INVALID"
                 )
 
             # ------------------------------------------------
@@ -1457,24 +1790,45 @@ def browser_login_complete(
                 "quota": quota
             }
 
+            stage = "SUCCESS"
+
+        except _LoginStageError as exc:
+
+            stage = exc.stage
+
+            result = None
+
         except PlaywrightTimeoutError:
 
             # 不打印 URL、页面信息、异常内容
+            stage = "PAGE_TIMEOUT"
+
             result = None
 
         except Exception:
 
             # 不打印异常
+            # browser 未创建成功说明是启动阶段失败
+            if browser is None:
+
+                stage = "BROWSER_LAUNCH_FAIL"
+
+            else:
+
+                stage = "UNEXPECTED"
+
             result = None
 
         finally:
 
-            try:
-                browser.close()
-            except Exception:
-                pass
+            if browser is not None:
 
-    return result
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+    return result, stage
 
 
 # ============================================================
@@ -1507,7 +1861,10 @@ def format_balance(
 def checkin_account(
     account: dict,
     total_accounts: int,
-) -> dict | None:
+    label: str = "",
+) -> tuple:
+
+    last_stage = "UNKNOWN"
 
     # --------------------------------------------------------
     # 通道一：
@@ -1516,39 +1873,122 @@ def checkin_account(
 
     if PROXY_SERVER:
 
-        result = browser_login_complete(
+        log(f"{label} 尝试自有节点登录")
+
+        result, last_stage = browser_login_complete(
             account
         )
 
         if result:
-            return result
+            return result, last_stage
+
+        log(
+            f"{label} 尝试（自有节点）: "
+            f"{last_stage}"
+        )
 
     # --------------------------------------------------------
     # 通道二：
     # 免费代理池（按站点独立队列，耗尽自动重探）
+    #
+    # 每轮最多尝试 MAX_LOGIN_ATTEMPTS 个代理
+    # （队列耗尽时随机提取新一批探测）；
+    # 整轮登录全部失败后重新提取代理再试，
+    # 最多 PROXY_LOGIN_ROUNDS 轮
     # --------------------------------------------------------
 
-    for _ in range(
-        MAX_LOGIN_ATTEMPTS
+    pool_attempted = False
+
+    for round_no in range(
+        1,
+        PROXY_LOGIN_ROUNDS + 1,
     ):
 
-        proxy = pop_proxy(
-            account["site"],
-            total_accounts,
-        )
+        for attempt_no in range(
+            MAX_LOGIN_ATTEMPTS
+        ):
 
-        if proxy is None:
+            proxy = pop_proxy(
+                account["site"],
+                total_accounts,
+            )
+
+            if proxy is None:
+
+                break
+
+            pool_attempted = True
+
+            # 代理已现场复检通过，开始登录
+            # （IP 打码输出，避免完整泄露）
+            log(
+                f"{label} 使用代理 "
+                f"{mask_proxy(proxy)} 登录"
+                f"（第{round_no}"
+                f"/{PROXY_LOGIN_ROUNDS}轮 "
+                f"尝试{attempt_no + 1}"
+                f"/{MAX_LOGIN_ATTEMPTS}）"
+            )
+
+            result, last_stage = browser_login_complete(
+                account,
+                proxy,
+            )
+
+            if result:
+                return result, last_stage
+
+            log(
+                f"{label} 第{round_no}轮"
+                f"尝试{attempt_no + 1}"
+                f"（代理池）: {last_stage}"
+            )
+
+        # 代理池已被标记不可用时，
+        # 后续轮次不会再拿到代理，直接结束
+        if account["site"] in POOL_BROKEN_SITES:
+
             break
 
-        attempt = browser_login_complete(
-            account,
-            proxy,
+    if not pool_attempted:
+
+        last_stage = "NO_PROXY"
+
+    # --------------------------------------------------------
+    # 兜底：
+    # 未配置自有节点时，代理池不可用或
+    # 全部尝试失败后，再尝试一次直连登录
+    #
+    # 每个站点只直连兜底一次：
+    # 直连失败说明 Runner IP 已被拦截，
+    # 后续账号重复直连只会白耗时间
+    # --------------------------------------------------------
+
+    if (
+        not PROXY_SERVER
+        and account["site"]
+        not in DIRECT_FAILED_SITES
+    ):
+
+        log(f"{label} 尝试直连登录（兜底）")
+
+        result, last_stage = browser_login_complete(
+            account
         )
 
-        if attempt:
-            return attempt
+        if result:
+            return result, last_stage
 
-    return None
+        DIRECT_FAILED_SITES.add(
+            account["site"]
+        )
+
+        log(
+            f"{label} 尝试（直连兜底）: "
+            f"{last_stage}，本站点后续不再直连"
+        )
+
+    return None, last_stage
 
 
 # ============================================================
@@ -1585,7 +2025,7 @@ def run_checkin():
     # 每个站点的账号计数（用于标签序号）
     site_counters = {}
 
-    for account in accounts:
+    for index, account in enumerate(accounts):
 
         site = account["site"]
 
@@ -1598,9 +2038,15 @@ def run_checkin():
             f"账号{site_counters[site]}"
         )
 
-        login_result = checkin_account(
+        log(
+            f"{label}: 开始签到"
+            f"（{index + 1}/{total}）"
+        )
+
+        login_result, stage = checkin_account(
             account,
             total,
+            label,
         )
 
         # ----------------------------------------------------
@@ -1609,10 +2055,11 @@ def run_checkin():
 
         if not login_result:
 
-            log(f"{label}: 签到失败")
+            # 只输出阶段码，不输出任何敏感信息
+            log(f"{label}: 签到失败（{stage}）")
 
             results.append(
-                (label, None)
+                (label, None, stage)
             )
 
             continue
@@ -1635,10 +2082,21 @@ def run_checkin():
         log(f"{label}: 当前余额 {balance}")
 
         results.append(
-            (label, balance)
+            (label, balance, "")
         )
 
         success_count += 1
+
+        # ----------------------------------------------------
+        # 多账号时随机间隔，
+        # 降低同 IP 连续登录触发 WAF 的概率
+        # ----------------------------------------------------
+
+        if index < total - 1:
+
+            time.sleep(
+                random.uniform(3, 8)
+            )
 
     # --------------------------------------------------------
     # 汇总 Telegram 通知
@@ -1649,12 +2107,12 @@ def run_checkin():
         "",
     ]
 
-    for label, balance in results:
+    for label, balance, stage in results:
 
         if balance is None:
 
             message_lines.append(
-                f"❌ {label}: 签到失败"
+                f"❌ {label}: 签到失败（{stage}）"
             )
 
         else:
@@ -1701,11 +2159,12 @@ def main():
         # 不打印任何敏感信息
         sys.exit(130)
 
-    except Exception:
+    except Exception as exc:
 
         # 不打印 traceback
-        # 不打印 exception 内容
-        log("脚本执行失败")
+        # 不打印 exception 内容（可能含敏感信息）
+        # 只打印异常类型，便于定位
+        log(f"脚本执行失败: {type(exc).__name__}")
 
         send_telegram(
             "❌ <b>签到脚本执行失败</b>"

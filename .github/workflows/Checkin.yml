@@ -50,22 +50,33 @@ jobs:
           pip install requests playwright pynacl pysocks
 
       # ==============================
-      # 4. 缓存 Playwright 浏览器
+      # 4. 记录 Playwright 版本
+      #    （用于浏览器缓存 key，版本变化时自动失效，
+      #      避免旧缓存与新版 Playwright 不匹配导致
+      #      BrowserType.launch 找不到浏览器）
+      # ==============================
+      - name: Get Playwright version
+        run: |
+          echo "PLAYWRIGHT_VERSION=$(python -c 'import importlib.metadata as m; print(m.version("playwright"))')" >> "$GITHUB_ENV"
+
+      # ==============================
+      # 5. 缓存 Playwright 浏览器
       # ==============================
       - name: Cache Playwright browsers
         uses: actions/cache@v5
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-v1
+          key: ${{ runner.os }}-playwright-${{ env.PLAYWRIGHT_VERSION }}
           restore-keys: |
             ${{ runner.os }}-playwright-
 
       # ==============================
-      # 5. 安装 Playwright Chromium
+      # 6. 安装 Playwright Chromium
       # ==============================
       - name: Install Playwright browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'
+
         run: |
           # 更换 Ubuntu 镜像源
           sudo sed -i \
@@ -90,7 +101,7 @@ jobs:
           playwright install --with-deps chromium
 
       # ==============================
-      # 6. 检查必要的文件
+      # 7. 检查必要的文件
       # ==============================
       - name: Check required files
         run: |
@@ -108,7 +119,7 @@ jobs:
           echo "✅ 必要文件检查通过"
 
       # ==============================
-      # 7. 检查 Secrets（NODE_LINK 可选）
+      # 8. 检查 Secrets（NODE_LINK 可选）
       # ==============================
       - name: Check required secrets
         env:
@@ -140,7 +151,7 @@ jobs:
           echo "✅ Secrets 基本检查通过"
 
       # ==============================
-      # 8. 设置代理（配置了 NODE_LINK / PROXY_CONFIG_URL 时启动 sing-box；
+      # 9. 设置代理（配置了 NODE_LINK / PROXY_CONFIG_URL 时启动 sing-box；
       #    否则脚本自动跳过，后续走代理池探测）
       # ==============================
       - name: Setup Proxy
@@ -152,7 +163,7 @@ jobs:
           bash setup-proxy.sh
 
       # ==============================
-      # 9. 执行签到（有 PROXY_SERVER 时用自有节点，
+      # 10. 执行签到（有 PROXY_SERVER 时用自有节点，
       #    失败或未配置时自动回退到代理池 WAF 探测）
       # ==============================
       - name: Run check-in script
@@ -167,7 +178,7 @@ jobs:
           python app.py
 
       # ==============================
-      # 10. 清理旧 Workflow 运行记录
+      # 11. 清理旧 Workflow 运行记录
       # ==============================
       - name: Clear old run jobs
         if: always()
@@ -197,7 +208,7 @@ jobs:
           echo "✅ 历史运行记录清理完成"
 
       # ==============================
-      # 11. 自动保活
+      # 12. 自动保活
       # ==============================
       #
       # GitHub Actions 长期没有 commit 可能被停用。
